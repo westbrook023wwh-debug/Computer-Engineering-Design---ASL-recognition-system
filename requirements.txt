@@ -1,0 +1,9 @@
+numpy>=1.24
+opencv-python>=4.8
+mediapipe>=0.10
+torch>=2.1
+tqdm>=4.66
+pandas>=2.0
+pyarrow>=14.0
+Pillow>=10.0
+matplotlib>=3.7

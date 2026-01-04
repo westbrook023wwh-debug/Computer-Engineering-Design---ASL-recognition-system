@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# Data / outputs
+data/
+checkpoints/
+runs/
+
+# IDE
+.vscode/
+.idea/
+
