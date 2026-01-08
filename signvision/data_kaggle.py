@@ -162,17 +162,11 @@ class KaggleASLSignsDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tens
         seq_len: int,
         feature_set: str = "hands",
         indices: np.ndarray | None = None,
+        sign_map_override: dict[str, int] | None = None,
     ) -> None:
         resolved_root = resolve_kaggle_root(root)
         self.paths = KagglePaths(Path(resolved_root))
         self.df = _read_csv_maybe_zipped(self.paths.train_csv)
-        if indices is not None:
-            self.df = self.df.iloc[indices].reset_index(drop=True)
-
-        self.sign_map: dict[str, int] = json.loads(_read_text_maybe_zipped(self.paths.sign_map_json, encoding="utf-8"))
-        self.seq_len = int(seq_len)
-        self.feature_set = feature_set
-        self.feature_dim = feature_dim_for_set(feature_set)
 
         # If train.csv references per-row file paths, drop rows whose parquet isn't available locally.
         # This prevents training from crashing when a partial subset has missing downloads.
@@ -186,6 +180,18 @@ class KaggleASLSignsDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tens
                     "Make sure `train_landmark_files/` exists for the full dataset, "
                     "or use `python -m signvision.kaggle_subset` to create a local subset."
                 )
+
+        if indices is not None:
+            self.df = self.df.iloc[indices].reset_index(drop=True)
+
+        self.sign_map: dict[str, int]
+        if sign_map_override is not None:
+            self.sign_map = dict(sign_map_override)
+        else:
+            self.sign_map = json.loads(_read_text_maybe_zipped(self.paths.sign_map_json, encoding="utf-8"))
+        self.seq_len = int(seq_len)
+        self.feature_set = feature_set
+        self.feature_dim = feature_dim_for_set(feature_set)
 
     def __len__(self) -> int:
         return len(self.df)

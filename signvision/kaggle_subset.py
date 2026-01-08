@@ -29,25 +29,51 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tmp", type=str, default="data/_kaggle_tmp", help="Temp download directory")
     p.add_argument("--cooldown-s", type=float, default=0.25, help="Sleep between file downloads to reduce 429s")
     p.add_argument("--max-attempts", type=int, default=5, help="Max download attempts per file")
+    p.add_argument(
+        "--max-new-downloads",
+        type=int,
+        default=200,
+        help="Max parquet files to attempt downloading in one run (run repeatedly to grow the subset).",
+    )
+    p.add_argument(
+        "--no-download",
+        action="store_true",
+        help="Do not download anything; only rewrite train.csv to include rows whose parquet already exists locally.",
+    )
     return p.parse_args()
 
 
-def _run(cmd: list[str], retries: int = 3, base_sleep_s: float = 2.0) -> tuple[bool, str]:
+def _is_rate_limited(out: str) -> bool:
+    lower = (out or "").lower()
+    return ("429" in lower and "too many requests" in lower) or "rate limit" in lower
+
+
+def _run(
+    cmd: list[str],
+    retries: int = 3,
+    base_sleep_s: float = 2.0,
+    timeout_s: float = 300.0,
+) -> tuple[bool, str]:
     """
     Runs a command with retries. Returns (ok, combined_output).
     """
     last_out = ""
     for attempt in range(max(0, retries) + 1):
         try:
-            cp = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            cp = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout_s)
             out = (cp.stdout or "") + (cp.stderr or "")
             return True, out
         except subprocess.CalledProcessError as e:
             out = (e.stdout or "") + (e.stderr or "")
             last_out = out
+            if _is_rate_limited(out):
+                return False, last_out
             if attempt >= retries:
                 return False, last_out
             time.sleep(base_sleep_s * (2**attempt))
+        except subprocess.TimeoutExpired:
+            last_out = "timeout"
+            return False, last_out
     return False, last_out
 
 
@@ -108,7 +134,8 @@ def _download_file(
     *,
     retries: int = 3,
     base_sleep_s: float = 2.0,
-) -> Path | None:
+    timeout_s: float = 300.0,
+) -> tuple[Path | None, bool]:
     """
     Downloads a single competition file via Kaggle CLI into out_dir and returns the local path.
     Note: Kaggle CLI flattens file_name to its basename when saving.
@@ -120,20 +147,24 @@ def _download_file(
         [kaggle, "competitions", "download", "-c", competition, "-p", str(out_dir), "-f", file_name, "-o"],
         retries=retries,
         base_sleep_s=base_sleep_s,
+        timeout_s=timeout_s,
     )
     if not ok:
         # Common case: rate limit (429). Don't fail the whole run; skip this file.
         msg = out.strip().splitlines()[-1] if out.strip() else "download failed"
-        print(f"[kaggle_subset] WARN: failed downloading {file_name}: {msg}")
-        return None
+        if _is_rate_limited(out):
+            print(f"[kaggle_subset] WARN: rate-limited downloading {file_name}: {msg}", flush=True)
+            return None, True
+        print(f"[kaggle_subset] WARN: failed downloading {file_name}: {msg}", flush=True)
+        return None, False
     if local.exists():
-        return local
+        return local, False
     # Some files may be delivered as .zip (rare); try that too.
     zipped = out_dir / (Path(file_name).name + ".zip")
     if zipped.exists():
-        return zipped
-    print(f"[kaggle_subset] WARN: download finished but file not found: {local}")
-    return None
+        return zipped, False
+    print(f"[kaggle_subset] WARN: download finished but file not found: {local}", flush=True)
+    return None, False
 
 
 def _read_first_from_zip(downloaded: Path, expected_suffix: str | None = None) -> bytes:
@@ -166,8 +197,10 @@ def _load_full_train(out_root: Path, tmp_root: Path, competition: str, retries: 
     """
     full = out_root / "train_full.csv"
     if not full.exists():
-        dl = _download_file(competition, "train.csv", tmp_root, retries=retries)
+        dl, rate_limited = _download_file(competition, "train.csv", tmp_root, retries=retries)
         if dl is None:
+            if rate_limited:
+                raise RuntimeError("Kaggle API rate limit (429). Please wait and retry later.")
             raise RuntimeError("Failed to download train.csv from Kaggle.")
         _ensure_plain_from_download(dl, full)
     return _read_train_rows(full)
@@ -185,8 +218,10 @@ def main() -> None:
     # Ensure label map exists (plain json).
     sign_map_dst = out_root / "sign_to_prediction_index_map.json"
     if not sign_map_dst.exists():
-        dl = _download_file(competition, "sign_to_prediction_index_map.json", tmp_root, retries=args.max_attempts)
+        dl, rate_limited = _download_file(competition, "sign_to_prediction_index_map.json", tmp_root, retries=args.max_attempts)
         if dl is None:
+            if rate_limited:
+                raise RuntimeError("Kaggle API rate limit (429). Please wait and retry later.")
             raise RuntimeError("Failed to download sign_to_prediction_index_map.json from Kaggle.")
         _ensure_plain_from_download(dl, sign_map_dst)
 
@@ -209,16 +244,45 @@ def main() -> None:
     missing = [r for r in rows if not exists_for_row(r)]
     rng.shuffle(missing)
     todo = missing[:need]
+    if args.max_new_downloads is not None and int(args.max_new_downloads) > 0:
+        todo = todo[: int(args.max_new_downloads)]
+
+    print(
+        f"[kaggle_subset] existing rows: {len(already)} | target: {target} | need: {need} | attempting this run: {len(todo)}",
+        flush=True,
+    )
+    if args.no_download:
+        todo = []
+        print("[kaggle_subset] --no-download set; will only rewrite train.csv from existing files.", flush=True)
 
     # Download required parquet files for new rows.
     downloaded_ok = 0
-    for r in todo:
+    rate_limited_count = 0
+    consecutive_rate_limited = 0
+    for i, r in enumerate(todo, start=1):
         rel = r["path"]
         if not rel:
             continue
-        src = _download_file(competition, rel, tmp_root, retries=args.max_attempts)
+        print(f"[kaggle_subset] ({i}/{len(todo)}) downloading: {rel}", flush=True)
+        src, rate_limited = _download_file(
+            competition,
+            rel,
+            tmp_root,
+            retries=args.max_attempts,
+        )
         if src is None:
+            if rate_limited:
+                rate_limited_count += 1
+                consecutive_rate_limited += 1
+                if consecutive_rate_limited >= 5:
+                    print(
+                        "[kaggle_subset] Hit rate limit repeatedly; stopping early. "
+                        "Try again later or increase --cooldown-s and lower --max-attempts.",
+                        flush=True,
+                    )
+                    break
             continue
+        consecutive_rate_limited = 0
         dst = out_root / rel
         _ensure_parent(dst)
 
@@ -239,7 +303,10 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(final)
 
-    print(f"Subset ready: {out_root} (rows={len(final)}/{target}, downloaded={downloaded_ok})")
+    print(
+        f"Subset ready: {out_root} (rows={len(final)}/{target}, downloaded={downloaded_ok}, rate_limited={rate_limited_count})",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
